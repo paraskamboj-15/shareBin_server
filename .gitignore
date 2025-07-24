@@ -1,0 +1,28 @@
+# dependencies
+/node_modules
+
+# environment variables
+.env
+
+# logs
+logs
+*.log
+npm-debug.log*
+
+# runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# coverage
+coverage/
+*.lcov
+
+# temp files
+tmp/
+temp/
+
+# OS & IDE
+.DS_Store
+.vscode/

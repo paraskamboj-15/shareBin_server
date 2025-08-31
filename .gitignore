@@ -26,3 +26,6 @@ temp/
 # OS & IDE
 .DS_Store
 .vscode/
+
+
+/uploads

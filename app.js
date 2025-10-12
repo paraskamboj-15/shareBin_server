@@ -259,7 +259,7 @@ app.get('/api/paste/:id', async (req, res, next) => {
 
 // Root endpoint
 app.get('/', (req, res) => {
-  res.send('API is working');
+  res.send('Share Bin API is working');
 });
 
 // 404 handler for unknown routes

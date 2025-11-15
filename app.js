@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const { nanoid } = require('nanoid');
 const cors = require('cors');
 const multer = require('multer');
-const fs = require('fs');
+// no filesystem usage for uploads — use memory storage to avoid writing to disk
 const CryptoJS = require('crypto-js');
 const bcrypt = require('bcryptjs'); 
 const path = require('path');
@@ -23,8 +23,7 @@ if (!ENCRYPTION_KEY || !DB_URL) {
 app.use(cors());
 app.use(express.json());
 
-const UPLOADS_DIR = path.join(__dirname, "uploads");
-app.use("/uploads", express.static(UPLOADS_DIR));
+// uploads will be kept in memory (no /uploads static route)
 
 // MongoDB connection
 mongoose.connect(DB_URL)
@@ -35,113 +34,41 @@ mongoose.connect(DB_URL)
   });
 
 // Mongoose schema
-const pasteSchema = new mongoose.Schema({
-  pasteId: { type: String, required: true, unique: true },
+const shareSchema = new mongoose.Schema({
+  shareId: { type: String, required: true, unique: true },
   content: String,
   contentType: { type: String, default: 'text/plain' },
+  // fileData stores base64 (or encrypted base64) when a file is uploaded. We avoid writing files to disk.
+  fileData: { type: String, default: null },
+  fileName: { type: String, default: null },
   fileUrl: String,
   isEncrypted: { type: Boolean, default: false },
-  passwordHash: { type: String, default: null }, // NEW
-  expiresAt: { type: Date, default: null },      // NEW
+  passwordHash: { type: String, default: null },
+  expiresAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 
 // Optional TTL index (CAUTION: this would NOT delete files from disk)
-// pasteSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// shareSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-const Paste = mongoose.model('Paste', pasteSchema);
+const Share = mongoose.model('Share', shareSchema);
 // Helpers
-const EXPIRY_MAP_MS = {
-  "12h": 12 * 60 * 60 * 1000,
-  "12hr": 12 * 60 * 60 * 1000,
-  "12hrs": 12 * 60 * 60 * 1000,
-  "1d": 24 * 60 * 60 * 1000,
-  "1day": 24 * 60 * 60 * 1000,
-  "2d": 2 * 24 * 60 * 60 * 1000,
-  "2days": 2 * 24 * 60 * 60 * 1000,
-  "4d": 4 * 24 * 60 * 60 * 1000,
-  "4days": 4 * 24 * 60 * 60 * 1000,
-  "5d": 5 * 24 * 60 * 60 * 1000,
-  "5days": 5 * 24 * 60 * 60 * 1000,
-  "none": null,
-  "no_deletion": null,
-  "never": null,
-};
-
-function computeExpiresAt(expiresIn) {
-  if (!expiresIn) return null;
-  const v = String(expiresIn).trim().toLowerCase();
-  if (v in EXPIRY_MAP_MS) {
-    const ms = EXPIRY_MAP_MS[v];
-    return ms ? new Date(Date.now() + ms) : null;
-  }
-  // generic patterns like "3h" or "7days"
-  const m = v.match(/^(\d+)\s*(h|hr|hrs|hour|hours|d|day|days)$/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    const unit = m[2];
-    const ms =
-      unit.startsWith("h") ? n * 60 * 60 * 1000 : n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() + ms);
-  }
+// expiry removed — server will not set automatic expiry to reduce storage churn on free hosts
+function computeExpiresAt() {
   return null;
 }
 
-function filePathFromUrl(fileUrl) {
-  if (!fileUrl) return null;
-  const filename = path.basename(fileUrl);
-  return path.join(UPLOADS_DIR, filename);
-}
+// No periodic purge — expiry disabled to avoid background storage operations on limited hosts
 
-async function deletePasteAndFile(paste) {
-  try {
-    if (paste.fileUrl) {
-      const fp = filePathFromUrl(paste.fileUrl);
-      if (fp && fs.existsSync(fp)) {
-        fs.unlinkSync(fp);
-      }
-    }
-  } catch (e) {
-    console.error("Error deleting file:", e.message);
-  } finally {
-    try {
-      await Paste.deleteOne({ _id: paste._id });
-    } catch (e) {
-      console.error("Error deleting paste doc:", e.message);
-    }
-  }
-}
-
-async function purgeExpiredPastes() {
-  const now = new Date();
-  const expired = await Paste.find({ expiresAt: { $ne: null, $lte: now } });
-  for (const p of expired) {
-    await deletePasteAndFile(p);
-  }
-}
-
-// run cleanup every 15 minutes
-setInterval(() => {
-  purgeExpiredPastes().catch((e) =>
-    console.error("cleanup error:", e.message)
-  );
-}, 15 * 60 * 1000);
-
-// File upload setup
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const safeFilename = file.originalname.replace(/\s+/g, "_");
-    cb(null, `${nanoid(8)}-${Date.now()}-${safeFilename}`);
-  },
-});
+// File upload setup: use memory storage to avoid writing to disk on the hosting platform
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// POST /api/paste
-app.post('/api/paste', upload.single('file'), async (req, res, next) => {
+// POST /api/share
+app.post('/api/share', upload.single('file'), async (req, res, next) => {
   try {
-    const pasteId = nanoid(6);
-    const { content, contentType, encrypt, password, expiresIn } = req.body;
+    const shareId = nanoid(6);
+    const { content, contentType, encrypt, password } = req.body;
 
     if (!content && !req.file) {
       return res.status(400).json({ error: 'Either content or file is required.' });
@@ -159,99 +86,143 @@ app.post('/api/paste', upload.single('file'), async (req, res, next) => {
       passwordHash = await bcrypt.hash(String(password), 10);
     }
 
-    const expiresAt = computeExpiresAt(expiresIn);
+    const expiresAt = computeExpiresAt();
 
     if (finalContent && shouldEncrypt) {
       finalContent = CryptoJS.AES.encrypt(finalContent, ENCRYPTION_KEY).toString();
     }
 
     if (req.file) {
-      fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-
+      // store file in memory as base64 (encrypted if requested) — no disk I/O
+      const base64 = req.file.buffer.toString('base64');
       if (shouldEncrypt) {
-        const fileBuffer = fs.readFileSync(req.file.path);
-        const encryptedFileContent = CryptoJS.AES.encrypt(
-          fileBuffer.toString("base64"),
-          ENCRYPTION_KEY
-        ).toString();
-        fs.writeFileSync(req.file.path, encryptedFileContent);
+        const encrypted = CryptoJS.AES.encrypt(base64, ENCRYPTION_KEY).toString();
+        // store encrypted base64 blob
+        fileUrl = null;
+        // will save encrypted data into fileData field below
+        req._incomingFileBase64 = encrypted;
+      } else {
+        req._incomingFileBase64 = base64;
       }
+      // preserve metadata
+      req._incomingFileName = req.file.originalname;
+      req._incomingFileType = req.file.mimetype;
     }
 
-    const paste = new Paste({
-      pasteId,
+    const shareObj = {
+      shareId,
       content: finalContent,
       contentType: contentType || req.file?.mimetype || 'text/plain',
-      fileUrl,
+      fileUrl: fileUrl || null,
       isEncrypted: shouldEncrypt,
       passwordHash,
       expiresAt,
-    });
+    };
 
-    await paste.save();
-    res.status(201).json({ pasteId, expiresAt });
+    if (req._incomingFileBase64) {
+      shareObj.fileData = req._incomingFileBase64;
+      shareObj.fileName = req._incomingFileName || null;
+      // For non-encrypted files we also optionally expose a data URL client-side via response
+    }
+
+    const share = new Share(shareObj);
+
+    await share.save();
+    res.status(201).json({ shareId, expiresAt });
   } catch (error) {
     next(error);
   }
 });
 
-// GET /api/paste/:id
-app.get('/api/paste/:id', async (req, res, next) => {
+// GET /api/share/:id
+app.get('/api/share/:id', async (req, res, next) => {
   try {
-    const paste = await Paste.findOne({ pasteId: req.params.id });
-    if (!paste) {
-      return res.status(404).json({ error: 'Paste not found' });
+    const share = await Share.findOne({ shareId: req.params.id });
+    if (!share) {
+      return res.status(404).json({ error: 'Share not found' });
     }
 
-    // Expiry check — if expired, clean up and return 410 Gone
-    if (paste.expiresAt && paste.expiresAt <= new Date()) {
-      await deletePasteAndFile(paste);
-      return res.status(410).json({ error: "Paste expired and deleted" });
-    }
+    // Expiry disabled — server does not auto-delete to avoid storage churn on limited hosts
 
     // If password protected, verify
-    if (paste.passwordHash) {
+    if (share.passwordHash) {
       const providedPassword =
-        req.headers["x-paste-password"] || req.query.password;
+        req.headers["x-share-password"] || req.query.password;
       if (!providedPassword) {
         return res.status(401).json({ error: "Password required" });
       }
-      const ok = await bcrypt.compare(String(providedPassword), paste.passwordHash);
+      const ok = await bcrypt.compare(String(providedPassword), share.passwordHash);
       if (!ok) {
         return res.status(403).json({ error: "Invalid password" });
       }
     }
 
-    const responsePaste = paste.toObject();
-    delete responsePaste.passwordHash;
+    const responseShare = share.toObject();
+    delete responseShare.passwordHash;
 
-    // Decrypt content if needed
-    if (paste.isEncrypted && paste.content) {
-      const bytes = CryptoJS.AES.decrypt(paste.content, ENCRYPTION_KEY);
-      const originalContent = bytes.toString(CryptoJS.enc.Utf8);
-      responsePaste.content = originalContent;
-      return res.json(responsePaste);
+    // If encrypted and has both text and file, return text + hasFile flag
+    if (share.isEncrypted) {
+      if (share.content) {
+        const bytes = CryptoJS.AES.decrypt(share.content, ENCRYPTION_KEY);
+        const originalContent = bytes.toString(CryptoJS.enc.Utf8);
+        responseShare.content = originalContent;
+      }
+      if (share.fileData) {
+        responseShare.hasFile = true;
+        responseShare.fileName = share.fileName || null;
+        responseShare.contentType = share.contentType || 'application/octet-stream';
+      } else {
+        responseShare.hasFile = false;
+      }
+      return res.json(responseShare);
     }
 
-    // If encrypted file, decrypt and stream binary
-    if (paste.isEncrypted && paste.fileUrl) {
-      const filePath = filePathFromUrl(paste.fileUrl);
-
-      if (filePath && fs.existsSync(filePath)) {
-        const encryptedContent = fs.readFileSync(filePath, "utf8");
-        const bytes = CryptoJS.AES.decrypt(encryptedContent, ENCRYPTION_KEY);
-        const decryptedBase64 = bytes.toString(CryptoJS.enc.Utf8);
-        const fileBuffer = Buffer.from(decryptedBase64, "base64");
-
-        res.set("Content-Type", paste.contentType);
-        return res.send(fileBuffer);
-      } else {
-        return res.status(404).json({ error: "Encrypted file missing" });
+    // Non-encrypted: handle file or text
+    if (share.fileData) {
+      responseShare.fileUrl = `data:${share.contentType};base64,${share.fileData}`;
+      responseShare.fileName = share.fileName || null;
+      return res.json(responseShare);
+    }
+    // No file data — return JSON (text-only share)
+    return res.json(responseShare);
+// GET /api/share/:id/file - fetch decrypted file blob (for encrypted shares)
+app.get('/api/share/:id/file', async (req, res, next) => {
+  try {
+    const share = await Share.findOne({ shareId: req.params.id });
+    if (!share || !share.fileData) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    // If password protected, verify
+    if (share.passwordHash) {
+      const providedPassword =
+        req.headers["x-share-password"] || req.query.password;
+      if (!providedPassword) {
+        return res.status(401).json({ error: "Password required" });
+      }
+      const ok = await bcrypt.compare(String(providedPassword), share.passwordHash);
+      if (!ok) {
+        return res.status(403).json({ error: "Invalid password" });
       }
     }
-
-    // Non-encrypted case: just return JSON (for files this includes the fileUrl)
-    return res.json(responsePaste);
+    if (!share.isEncrypted) {
+      // Should not be used for non-encrypted files
+      return res.status(400).json({ error: 'File is not encrypted' });
+    }
+    // Decrypt and send file
+    try {
+      const bytes = CryptoJS.AES.decrypt(share.fileData, ENCRYPTION_KEY);
+      const decryptedBase64 = bytes.toString(CryptoJS.enc.Utf8);
+      const fileBuffer = Buffer.from(decryptedBase64, "base64");
+      res.set("Content-Type", share.contentType || "application/octet-stream");
+      res.set("Content-Disposition", `attachment; filename=\"${share.fileName || 'file'}\"`);
+      return res.send(fileBuffer);
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to decrypt file data" });
+    }
+  } catch (error) {
+    next(error);
+  }
+});
   } catch (error) {
     next(error);
   }
